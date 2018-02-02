@@ -9,6 +9,23 @@ extern "C" {
 #define FP_RAW_IMAGE_SIZE (19200)
 #define FP_DEFAULT_TIMEOUT (200)
 
+#define NV_FPBASE_INDEX (0x00008000)
+#define FP_TEMPLATE_SIZE (498)
+#define FP_SLOTS_MAX (200)
+#define FP_SLOTS (2)
+#define FP_AUTHORIZE_INDEX (NV_FPBASE_INDEX + FP_SLOTS_MAX)
+#define FP_DISPLAY_INDEX (FP_AUTHORIZE_INDEX + 1)
+#define FP_DISPLAY_MAX_TEXT (256)
+
+
+#define FP_SLOT_INITIALIZE_TEMPLATE (0x00)
+#define FP_SLOT_DELETE_ALL_TEMPLATE (0x01)
+#define FP_SLOT_DELETE_TEMPLATE (0x02)
+#define FP_SLOT_ENROLL_TEMPLATE (0x03)
+#define FP_AUTHORIZE_INITIALIZE (0x00)
+#define FP_AUTHORIZE_VERIFY (0x01)
+#define FP_AUTHORIZE_TIMEOUT (0x02)
+
 typedef enum FPR_COMMAND_CODE
 {
     FPR_COMMAND_OPEN = 0x01,
@@ -103,6 +120,9 @@ typedef enum FPR_STATE_MACHINE
     FPR_STATE_MACHINE_VERIFY_PRESS,
     FPR_STATE_MACHINE_VERIFY_SCAN,
 
+    FPR_STATE_MACHINE_IDENTIFY_PRESS,
+    FPR_STATE_MACHINE_IDENTIFY_SCAN,
+
     FPR_STATE_MACHINE_END = 0xffffffff
 } FPR_STATE_MACHINE;
 
@@ -122,10 +142,11 @@ typedef union FPR_COMMAND_RESPONSE_PACKET_T
     unsigned char raw[sizeof(FPR_COMMAND_RESPONSE_DATA)];
 } FPR_COMMAND_RESPONSE_PACKET_T;
 
-// Extern callbacks
+// Platform Callbacks
+FPR_ERROR_CODE InitializeFPR(char* port, char re_init);
 unsigned char ReadCharFPR(int* timeout);
 void WriteCharFPR(unsigned char data, int* timeout);
-void SleepFPR(unsigned int duration);
+void CloseFPR(void);
 
 // FPR APIs
 FPR_ERROR_CODE FPR_Open(DEV_INFO_FPR* info);
@@ -157,6 +178,11 @@ FPR_ERROR_CODE FPR_WaitForFinger(unsigned char pressed, unsigned int cycles);
 FPR_ERROR_CODE FPR_EnrollFinger(FPR_STATE_MACHINE* state, unsigned int id, unsigned char noDupChk, unsigned char noSave, unsigned char* fpTemplate);
 FPR_ERROR_CODE FPR_VerifyFinger(FPR_STATE_MACHINE* state, unsigned int id);
 FPR_ERROR_CODE FPR_IdentifyFinger(FPR_STATE_MACHINE* state, unsigned int* id);
+
+FPR_ERROR_CODE FPR_TPMWrite(UINT32 index, UINT8* data, UINT32 size, UINT32 offset);
+FPR_ERROR_CODE FPR_TPMRead(UINT32 index, UINT8* data, UINT32 size, UINT32 offset);
+FPR_ERROR_CODE TDisp_Write(UINT8* data, UINT32 size, UINT32 offset);
+FPR_ERROR_CODE TDisp_Read(UINT8* data, UINT32 size, UINT32 offset);
 
 #ifdef __cplusplus
 }

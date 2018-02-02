@@ -1,3 +1,8 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <tchar.h>
+#include <Windows.h>
+
 #include "FPLib.h"
 
 COMMAND_INFO cmdInfo[] = {
@@ -33,6 +38,142 @@ COMMAND_INFO cmdInfo[] = {
 {FPR_COMMAND_INVALID, 0, 0}
 };
 
+HANDLE hFPR = INVALID_HANDLE_VALUE;
+unsigned short fpTimeout = 30000;
+char displayText[FP_DISPLAY_MAX_TEXT + 1] = { 0 };
+unsigned int displayTextLen = 0;
+
+// External cancel
+#ifndef _plat__IsCanceled
+int _plat__IsCanceled(void)
+{
+    return 0;
+}
+#endif
+
+FPR_ERROR_CODE InitializeFPR(char* port, char re_init)
+{
+    FPR_ERROR_CODE result = FPR_ERROR_ACK_SUCCESS;
+    DEV_INFO_FPR devInfo = { 0 };
+
+    if (hFPR != INVALID_HANDLE_VALUE)
+    {
+        if (!re_init)
+        {
+            goto Cleanup;
+        }
+        FPR_Close();
+        CloseHandle(hFPR);
+        hFPR = INVALID_HANDLE_VALUE;
+    }
+
+    if ((hFPR = CreateFileA(port, GENERIC_READ || GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)) == INVALID_HANDLE_VALUE)
+    {
+        result = FPR_ERROR_NACK_COMM_ERR;
+        goto Cleanup;
+    }
+    if (!PurgeComm(hFPR, PURGE_TXABORT | PURGE_RXABORT | PURGE_TXCLEAR | PURGE_RXCLEAR))
+    {
+        result = FPR_ERROR_NACK_COMM_ERR;
+        goto Cleanup;
+    }
+    DCB dcb;
+    memset(&dcb, 0, sizeof(DCB));
+    dcb.DCBlength = sizeof(DCB);
+    dcb.BaudRate = CBR_9600;
+    dcb.fBinary = TRUE;
+    dcb.fParity = FALSE;
+    dcb.ByteSize = 8;
+    dcb.Parity = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.fAbortOnError = TRUE;
+    if (!SetCommState(hFPR, &dcb))
+    {
+        result = FPR_ERROR_NACK_COMM_ERR;
+        goto Cleanup;
+    }
+    COMMTIMEOUTS to;
+    to.ReadIntervalTimeout = 0;
+    to.ReadTotalTimeoutMultiplier = 0;
+    to.ReadTotalTimeoutConstant = 16;
+    to.WriteTotalTimeoutMultiplier = 0;
+    to.WriteTotalTimeoutConstant = 16;
+    if (!SetCommTimeouts(hFPR, &to))
+    {
+        result = FPR_ERROR_NACK_COMM_ERR;
+        goto Cleanup;
+    }
+    result = FPR_ChangeBaudrate(115200);
+    if ((result != FPR_ERROR_ACK_SUCCESS) && (result != FPR_ERROR_NACK_TIMEOUT))
+    {
+        goto Cleanup;
+    }
+    result = FPR_ERROR_ACK_SUCCESS;
+    dcb.BaudRate = CBR_115200;
+    if (!SetCommState(hFPR, &dcb))
+    {
+        result = FPR_ERROR_NACK_COMM_ERR;
+        goto Cleanup;
+
+    }
+    if ((result = FPR_Open(&devInfo)) != FPR_ERROR_ACK_SUCCESS)
+    {
+        result = FPR_ERROR_NACK_DEV_ERR;
+        goto Cleanup;
+    }
+    if ((result = FPR_CMOSLEDControl(0)) != FPR_ERROR_ACK_SUCCESS)
+    {
+        goto Cleanup;
+    }
+
+Cleanup:
+    if (result != FPR_ERROR_ACK_SUCCESS)
+    {
+        FPR_Close();
+        CloseHandle(hFPR);
+        hFPR = INVALID_HANDLE_VALUE;
+    }
+    return result;
+}
+
+unsigned char ReadCharFPR(int* timeout)
+{
+    unsigned int startTime = GetTickCount();
+    unsigned char data = 0;
+    unsigned int read = 0;
+    COMMTIMEOUTS to;
+    to.ReadIntervalTimeout = 0;
+    to.ReadTotalTimeoutMultiplier = 0;
+    to.ReadTotalTimeoutConstant = (unsigned int)*timeout;
+    to.WriteTotalTimeoutMultiplier = 0;
+    to.WriteTotalTimeoutConstant = 16;
+    if (!SetCommTimeouts(hFPR, &to))
+    {
+        goto Cleanup;
+    }
+    if (!ReadFile(hFPR, &data, 1, (LPDWORD)&read, NULL))
+    {
+        goto Cleanup;
+    }
+
+Cleanup:
+    *timeout -= GetTickCount() - startTime;
+    return data;
+}
+
+void WriteCharFPR(unsigned char data, int* timeout)
+{
+    unsigned int startTime = GetTickCount();
+    TransmitCommChar(hFPR, data);
+    *timeout -= GetTickCount() - startTime;
+}
+
+void CloseFPR(void)
+{
+    CloseHandle(hFPR);
+    hFPR = INVALID_HANDLE_VALUE;
+}
+
 static COMMAND_INFO* GetCommandInfo(
     FPR_COMMAND_CODE cmd)
 {
@@ -43,7 +184,7 @@ static COMMAND_INFO* GetCommandInfo(
     return 0;
 }
 
-static unsigned int CheckSum(
+static unsigned short CheckSum(
     unsigned short sumIn,
     unsigned char* data,
     unsigned int len)
@@ -67,7 +208,6 @@ static FPR_ERROR_CODE Execute(
     COMMAND_INFO* info = GetCommandInfo(cmd);
     FPR_COMMAND_RESPONSE_PACKET_T in;
     FPR_COMMAND_RESPONSE_PACKET_T out;
-    unsigned short chkSum = 0;
 
     // check valid command
     if (info == 0)
@@ -467,10 +607,6 @@ Restart:
         }
         if (*state == FPR_STATE_MACHINE_ENROLL_THIRD_SCAN)
         {
-            if ((result = FPR_CMOSLEDControl(0)) != FPR_ERROR_ACK_SUCCESS)
-            {
-                goto Cleanup;
-            }
             *state = FPR_STATE_MACHINE_END;
             goto Cleanup;
         }
@@ -580,10 +716,10 @@ FPR_ERROR_CODE FPR_IdentifyFinger(FPR_STATE_MACHINE* state, unsigned int* id)
         {
             goto Cleanup;
         }
-        *state = FPR_STATE_MACHINE_VERIFY_PRESS;
+        *state = FPR_STATE_MACHINE_IDENTIFY_PRESS;
     }
 
-    if (*state == FPR_STATE_MACHINE_VERIFY_PRESS)
+    if (*state == FPR_STATE_MACHINE_IDENTIFY_PRESS)
     {
         result = FPR_IsPressFinger();
         if (result == FPR_ERROR_ACK_SUCCESS)
@@ -601,15 +737,20 @@ FPR_ERROR_CODE FPR_IdentifyFinger(FPR_STATE_MACHINE* state, unsigned int* id)
         }
     }
 
-    if (*state == FPR_STATE_MACHINE_VERIFY_SCAN)
+    if (*state == FPR_STATE_MACHINE_IDENTIFY_SCAN)
     {
-        if ((result = FPR_CaptureFinger(1)) != FPR_ERROR_ACK_SUCCESS)
+        result = FPR_CaptureFinger(1);
+        if (result == FPR_ERROR_ACK_SUCCESS)
         {
-            goto Cleanup;
+            result = FPR_Identify(id);
+            FPR_CMOSLEDControl(0);
         }
-        result = FPR_Identify(id);
-        FPR_CMOSLEDControl(0);
-        if (result != FPR_ERROR_ACK_SUCCESS)
+        else if (result == FPR_ERROR_NACK_FINGER_IS_NOT_PRESSED)
+        {
+            *state = FPR_STATE_MACHINE_IDENTIFY_PRESS;
+            result = FPR_ERROR_ACK_SUCCESS;
+        }
+        else
         {
             goto Cleanup;
         }
@@ -620,4 +761,281 @@ FPR_ERROR_CODE FPR_IdentifyFinger(FPR_STATE_MACHINE* state, unsigned int* id)
 
 Cleanup:
     return result;
+}
+
+FPR_ERROR_CODE FPR_TPMWrite(UINT32 index, UINT8* data, UINT32 size, UINT32 offset)
+{
+    FPR_ERROR_CODE result = FPR_ERROR_NACK_INVALID_PARAM;
+    FPR_STATE_MACHINE state = FPR_STATE_MACHINE_START;
+
+    if ((result = InitializeFPR("COM5", 0)) != FPR_ERROR_ACK_SUCCESS)
+    {
+        goto Cleanup;
+    }
+
+    if (index < FP_AUTHORIZE_INDEX)
+    {
+        unsigned int fpSlot = index - NV_FPBASE_INDEX;
+        if (size == sizeof(unsigned char))
+        {
+            if (data[0] == FP_SLOT_INITIALIZE_TEMPLATE)
+            {
+                // NOOP
+                result = FPR_ERROR_ACK_SUCCESS;
+            }
+            else if (data[0] == FP_SLOT_DELETE_ALL_TEMPLATE)
+            {
+                // Delete All
+                result = FPR_DeleteAll();
+                if ((result != FPR_ERROR_ACK_SUCCESS) && (result != FPR_ERROR_NACK_DB_IS_EMPTY))
+                {
+                    //printf("FPR_DeleteAll() returned 0x%08x\n", result);
+                    goto Cleanup;
+                }
+                else
+                {
+                    result = FPR_ERROR_ACK_SUCCESS;
+                }
+            }
+            else if (data[0] == FP_SLOT_DELETE_TEMPLATE)
+            {
+                // Delete
+                result = FPR_DeleteId(fpSlot);
+                if ((result != FPR_ERROR_ACK_SUCCESS) && (result != FPR_ERROR_NACK_IS_NOT_USED))
+                {
+                    //printf("FPR_DeleteId() returned 0x%08x\n", result);
+                    goto Cleanup;
+                }
+                else
+                {
+                    result = FPR_ERROR_ACK_SUCCESS;
+                }
+            }
+            else if (data[0] == FP_SLOT_ENROLL_TEMPLATE)
+            {
+                unsigned int deadline = GetTickCount() + fpTimeout;
+                unsigned int secsLeft = fpTimeout / 1000;
+                if ((result = FPR_CheckEnrolled(fpSlot)) == FPR_ERROR_ACK_SUCCESS)
+                {
+                    result = FPR_DeleteId(fpSlot);
+                }
+                // Enroll
+                state = FPR_STATE_MACHINE_START;
+                do
+                {
+                    if ((result = FPR_EnrollFinger(&state, fpSlot, 0, 0, 0)) != FPR_ERROR_ACK_SUCCESS)
+                    {
+                        printf("FPR_EnrollFinger() in state %d returned 0x%08x\n", state, result);
+                        goto Cleanup;
+                    }
+                    if (state != FPR_STATE_MACHINE_END)
+                    {
+                        Sleep(1);
+                        if (secsLeft > ((deadline - GetTickCount()) / 1000))
+                        {
+                            secsLeft--;
+                            printf("[TrustedDisplay]: %s (%d sec)                  \r", displayText, secsLeft);
+                        }
+                    }
+                    if (deadline <= GetTickCount())
+                    {
+                        result = FPR_ERROR_NACK_TIMEOUT;
+                        state = FPR_STATE_MACHINE_END;
+                        //printf("FPR_EnrollFinger() timed out.\n");
+                        goto Cleanup;
+                    }
+                    if (_plat__IsCanceled())
+                    {
+                        result = FPR_ERROR_NACK_CAPTURE_CANCELED;
+                        state = FPR_STATE_MACHINE_END;
+                        //printf("FPR_IdentifyFinger() canceled.\n");
+                        goto Cleanup;
+                    }
+                } while (state != FPR_STATE_MACHINE_END);
+                printf("[TrustedDisplay]: %s                  \r", displayText);
+            }
+        }
+        else if (size == FP_TEMPLATE_SIZE)
+        {
+            if ((result = FPR_CheckEnrolled(fpSlot)) == FPR_ERROR_ACK_SUCCESS)
+            {
+                result = FPR_DeleteId(fpSlot);
+            }
+            // Template Write
+            result = FPR_SetTemplate(fpSlot, data);
+            if (result != FPR_ERROR_ACK_SUCCESS)
+            {
+                //printf("FPR_SetTemplate() returned 0x%08x\n", result);
+                goto Cleanup;
+            }
+            else
+            {
+                result = FPR_ERROR_ACK_SUCCESS;
+            }
+        }
+    }
+    else if((index == FP_AUTHORIZE_INDEX) && (size == sizeof(unsigned int)))
+    {
+        if (data[3] == FP_AUTHORIZE_INITIALIZE)
+        {
+            // NOOP
+            result = FPR_ERROR_ACK_SUCCESS;
+        }
+        else if (data[3] == FP_AUTHORIZE_TIMEOUT)
+        {
+            fpTimeout = (unsigned short)(*((unsigned int*)data) & 0x0000ffff);
+        }
+        else if (data[3] == FP_AUTHORIZE_VERIFY)
+        {
+            // Verify
+            unsigned int verify = *((unsigned int*)data) & 0x00ffffff;
+            unsigned int deadline = GetTickCount() + fpTimeout;
+            unsigned int secsLeft = fpTimeout / 1000;
+            state = FPR_STATE_MACHINE_START;
+            do
+            {
+                result = FPR_VerifyFinger(&state, verify);
+                if ((result != FPR_ERROR_ACK_SUCCESS) && (result != FPR_ERROR_NACK_VERIFY_FAILED))
+                {
+                    printf("\nFPR_VerifyFinger() in state %d returned 0x%08x\n", state, result);
+                    goto Cleanup;
+                }
+                if (state != FPR_STATE_MACHINE_END)
+                {
+                    Sleep(1);
+                    if (secsLeft > ((deadline - GetTickCount()) / 1000))
+                    {
+                        secsLeft--;
+                        printf("[TrustedDisplay]: %s (%d sec)                  \r", displayText, secsLeft);
+                    }
+                }
+                if (deadline <= GetTickCount())
+                {
+                    result = FPR_ERROR_NACK_TIMEOUT;
+                    state = FPR_STATE_MACHINE_END;
+                    //printf("FPR_VerifyFinger() timed out.\n");
+                    goto Cleanup;
+                }
+                if (_plat__IsCanceled())
+                {
+                    result = FPR_ERROR_NACK_CAPTURE_CANCELED;
+                    state = FPR_STATE_MACHINE_END;
+                    //printf("FPR_IdentifyFinger() canceled.\n");
+                    goto Cleanup;
+                }
+            } while (state != FPR_STATE_MACHINE_END);
+            printf("[TrustedDisplay]: %s                  \r", displayText);
+        }
+    }
+
+Cleanup:
+    FPR_CMOSLEDControl(0);
+    return result;
+}
+
+FPR_ERROR_CODE FPR_TPMRead(UINT32 index, UINT8* data, UINT32 size, UINT32 offset)
+{
+    FPR_ERROR_CODE result = FPR_ERROR_NACK_INVALID_PARAM;
+    FPR_STATE_MACHINE state = FPR_STATE_MACHINE_START;
+
+    if ((result = InitializeFPR("COM5", 0)) != FPR_ERROR_ACK_SUCCESS)
+    {
+        goto Cleanup;
+    }
+
+    if ((index < FP_AUTHORIZE_INDEX) && (size == FP_TEMPLATE_SIZE))
+    {
+        unsigned int fpSlot = index - NV_FPBASE_INDEX;
+        // Template read
+        result = FPR_GetTemplate(fpSlot, data);
+        if ((result != FPR_ERROR_ACK_SUCCESS) &&
+            (result != FPR_ERROR_NACK_IS_NOT_USED) &&
+            (result != FPR_ERROR_NACK_DB_IS_EMPTY))
+        {
+            //printf("FPR_GetTemplate() returned 0x%08x\n", result);
+            goto Cleanup;
+        }
+    }
+    else if ((index == FP_AUTHORIZE_INDEX) && (size == sizeof(unsigned int)))
+    {
+        // Identify
+        unsigned int* identify = (unsigned int*)data;
+        unsigned int deadline = GetTickCount() + fpTimeout;
+        unsigned int secsLeft = fpTimeout / 1000;
+        state = FPR_STATE_MACHINE_START;
+        do
+        {
+            result = FPR_IdentifyFinger(&state, identify);
+            if (result == FPR_ERROR_NACK_IDENTIFY_FAILED)
+            {
+                *identify = (unsigned int)-1;
+                result = FPR_ERROR_ACK_SUCCESS;
+                goto Cleanup;
+            }
+            else if (result != FPR_ERROR_ACK_SUCCESS)
+            {
+                printf("FPR_IdentifyFinger() in state %d returned 0x%08x\n", state, result);
+                goto Cleanup;
+            }
+            if (state != FPR_STATE_MACHINE_END)
+            {
+                Sleep(1);
+                if (secsLeft > ((deadline - GetTickCount()) / 1000))
+                {
+                    secsLeft--;
+                    printf("[TrustedDisplay]: %s (%d sec)                  \r", displayText, secsLeft);
+                }
+            }
+            if (deadline <= GetTickCount())
+            {
+                result = FPR_ERROR_NACK_TIMEOUT;
+                state = FPR_STATE_MACHINE_END;
+                //printf("FPR_IdentifyFinger() timed out.\n");
+                goto Cleanup;
+            }
+            if (_plat__IsCanceled())
+            {
+                result = FPR_ERROR_NACK_CAPTURE_CANCELED;
+                state = FPR_STATE_MACHINE_END;
+                //printf("FPR_IdentifyFinger() canceled.\n");
+                goto Cleanup;
+            }
+        } while (state != FPR_STATE_MACHINE_END);
+        printf("[TrustedDisplay]: %s                  \r", displayText);
+    }
+
+Cleanup:
+    FPR_CMOSLEDControl(0);
+    return result;
+}
+
+FPR_ERROR_CODE TDisp_Write(UINT8* data, UINT32 size, UINT32 offset)
+{
+    if ((offset + size) >= FP_DISPLAY_MAX_TEXT)
+    {
+        return FPR_ERROR_NACK_INVALID_PARAM;
+    }
+    if (size > 0)
+    {
+        memcpy(&displayText[offset], data, size);
+        displayText[FP_DISPLAY_MAX_TEXT] = 0x00;
+        printf("[TrustedDisplay]: %s                  \r", displayText);
+    }
+    else
+    {
+        memset(displayText, 0x00, sizeof(displayText));
+        printf("\n");
+    }
+
+    return FPR_ERROR_ACK_SUCCESS;
+}
+
+FPR_ERROR_CODE TDisp_Read(UINT8* data, UINT32 size, UINT32 offset)
+{
+    if ((offset + size) >= FP_DISPLAY_MAX_TEXT)
+    {
+        return FPR_ERROR_NACK_INVALID_PARAM;
+    }
+    memcpy(data, &displayText[offset], size);
+    return FPR_ERROR_ACK_SUCCESS;
 }
